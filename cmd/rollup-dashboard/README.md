@@ -255,5 +255,5 @@ The health bar polls the following endpoints. They come from the built-in local 
 ## See Also
 
 - [rollup-monitor](../rollup-monitor/) -- Standalone monitoring TUI (read-only; attaches to a running node; shares the Prometheus-scrape and sync-status code this dashboard now imports)
-- [rollup-healthcheck](../rollup-healthcheck/) -- One-shot / `--watch` health checker for a running rollup
-- `oprsk-node` ([../oprsk-node/](../oprsk-node/)) -- the consensus node binary; in the per-service stack the dashboard attaches to it rather than spawning it
+- [rollup-healthcheck](https://github.com/rsksmart/rootstack/tree/main/cmd/rollup-healthcheck) -- One-shot / `--watch` health checker for a running rollup
+- `oprsk-node` ([rootstack cmd/oprsk-node](https://github.com/rsksmart/rootstack/tree/main/cmd/oprsk-node)) -- the consensus node binary; in the per-service stack the dashboard attaches to it rather than spawning it
