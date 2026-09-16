@@ -1,0 +1,634 @@
+# experiment.example.toml — Example configuration for rollup-experiment
+#
+# Copy this file and customize it for your experiments:
+#   cp experiment.example.toml my-experiment.toml
+#   rollup-experiment --config my-experiment.toml
+#
+# The experiment tool:
+#   1. Expands batcher array values into N runs (cartesian product)
+#   2. Optionally expands simulation.simple_tx rate_runs (one run per rate × batcher sweep)
+#   3. For each run: starts batcher, drives traffic with dynamic curves, collects metrics
+#   4. Generates enriched CSV + markdown report
+#
+# === Value types for simulation knobs ===
+#
+# Simulation knob values can take several forms:
+#
+#   Single number (constant):
+#     rate = 10.0              # held throughout the entire simulation
+#
+#   Array (curve, piecewise-linear interpolation):
+#     rate = [1.0, 10.0, 50.0, 100.0]
+#     # 4 points placed at 0%, 33%, 67%, 100% of simulation length;
+#     # intermediate values are linearly interpolated.
+#
+#   Two-element array (minmax linear ramp):
+#     rate = [1.0, 100.0]     # linearly ramps from 1 to 100 over the run
+#
+#   Random (uniform random value each tick within bounds):
+#     rate = { random = true, min = 1.0, max = 100.0 }
+#     rate = { random = true, cap = 50.0 }  # shorthand for min=0, max=50
+#     rate = { random = true }               # default: min=0, max=100
+#
+#   Base curve + jitter (deterministic shape with additive noise):
+#     rate = { base = [1.0, 50.0], jitter = 5.0 }
+#     # At each tick the base curve is evaluated and a uniform random
+#     # offset in [-5, +5] is added (clamped to >= 0).
+#
+# For batcher knobs, arrays mean "sweep": one experiment run per value
+# (or per combination when multiple batcher knobs are arrays).
+#
+# For simple_tx, rate_runs = [a, b, c] means three separate experiment runs
+# (per batcher combo), each at a constant tx/s rate. Omit rate or set rate = 0;
+# do not combine rate_runs with adaptive/random/jitter or multi-point rate arrays.
+
+# ==============================================================================
+# Target: the running L2 infrastructure to connect to
+# The experiment tool does NOT deploy or start the rollup. It connects to an
+# already-running rollup-node (op-geth + op-node). The batcher can optionally
+# be managed by the tool (see --batcher-bin flag).
+# ==============================================================================
+[target]
+# L1 RPC endpoint (RSK testnet or regtest)
+# Required — no default
+l1_rpc = "https://public-node.testnet.rsk.co"
+# l1_rpc = "http://127.0.0.1:7777"
+
+# L2 execution engine RPC (op-geth)
+# Default: "http://127.0.0.1:8545"
+l2_rpc = "http://127.0.0.1:8545"
+
+# op-node consensus RPC (for safe/unsafe head tracking via optimism_syncStatus)
+# Default: "http://127.0.0.1:9545"
+node_rpc = "http://127.0.0.1:9545"
+
+# Private key (hex) used for traffic generation and bridge operations.
+# Can include or omit the 0x prefix. Also accepted via env EXPERIMENT_PRIVATE_KEY.
+# This account must be funded on both L1 and L2.
+# Required — no default
+private_key = ""
+
+# Deployment working directory containing rollup.json and l1.json.
+# These files are needed for batcher detection, batch inbox address, and
+# bridge contract addresses. Typically a path like "./33_04_02_2026_300146".
+# Required for bridge operations and batcher validation — no default
+workdir = ""
+
+# Prometheus metrics endpoint of the op-batcher.
+# Used to collect the real compression ratio (compressed / uncompressed bytes)
+# for each closed batcher channel. When unset or unreachable, the
+# "Compression Ratio" chart falls back to showing raw calldata byte sizes,
+# which can be misleading (values in the thousands instead of 0–1).
+# Default: "http://127.0.0.1:7300/metrics"
+batcher_metrics_url = "http://127.0.0.1:7300/metrics"
+
+# Batcher admin RPC endpoint for controlling the batcher via RPC.
+# When set (and no batcher binary is specified), the experiment controls the
+# batcher via admin_startBatcher/admin_stopBatcher/admin_flushBatcher RPC calls
+# instead of spawning a subprocess. This is useful when the batcher runs
+# embedded in the rollup-node.
+# Default: not set (subprocess mode if batcher_bin is provided)
+# batcher_rpc_url = "http://127.0.0.1:8548"
+
+# Path to batcher config file (TOML). Used with batcher_rpc_url to write
+# batcher parameters before starting. The experiment updates the [batcher]
+# section with run-specific values (max_l1_tx_size, max_channel_duration, etc.)
+# NOTE: Standard op-batcher does NOT reload config on admin_startBatcher.
+# This is useful if you have a modified batcher that reloads, or for logging.
+# batcher_config_path = "/path/to/rollup-node.toml"
+
+# Prometheus metrics endpoints for op-node and op-proposer.
+# Enables derivation health, proposer progress, and enhanced batcher pipeline
+# metrics in the live TUI and CSV output.
+# Default: not set
+# node_metrics_url = "http://127.0.0.1:7301/metrics"
+# proposer_metrics_url = "http://127.0.0.1:7302/metrics"
+
+# pprof endpoints for runtime profiling (heap memory, goroutine counts).
+# Polled on a slow cadence (every 30s) for the "Process Health" chart.
+# Default: not set
+# node_pprof_url = "http://127.0.0.1:6061"
+# batcher_pprof_url = "http://127.0.0.1:6063"
+# proposer_pprof_url = "http://127.0.0.1:6062"
+
+# ==============================================================================
+# Simulation: dynamic parameters that change during each experiment run
+# ==============================================================================
+[simulation]
+# How long to run each experiment. Supported formats:
+#   "10m"              wall-clock duration (Go duration syntax: s, m, h)
+#   "1h30m"            composite duration
+#   "500 data-points"  stop after N CSV rows have been written
+#   "100 l1-blocks"    stop after N new L1 blocks are observed
+#   "200 l2-blocks"    stop after N new L2 blocks are observed
+#   "50 batcher-posts"   stop after N batcher txs are posted to L1
+#   "30 batcher-blocks"  stop after N L1 blocks containing batcher txs
+#
+# Multiple conditions (OR — stop when the first is met):
+#   length = ["10m", "50 batcher-posts"]
+#
+# Default: "10m"
+length = "10m"
+
+# Number of L2 accounts to use for sending transactions.
+# With multiple accounts, the traffic simulator distributes load round-robin
+# to avoid single-account nonce bottlenecks at high rates.
+# Each account is deterministically derived from the master private key and
+# auto-funded from the master before traffic begins.
+# Default: 1
+accounts = 10
+
+# If true, all simple txs use the sender as the recipient (self-transfers).
+# This is the cheapest tx type (21000 gas) and isolates L2 throughput
+# measurement from contract execution overhead.
+# Default: false
+only_monologues = false
+
+# How often to snapshot metrics and write a CSV row.
+# This is the temporal resolution of the output data. Shorter intervals give
+# finer-grained curves but larger CSV files.
+# Default: "2s"
+sample_interval = "2s"
+
+# After the experiment finishes, sweep remaining RBTC (and ERC20) balances
+# from derived traffic accounts back to the master account. Set to false to
+# leave funds in derived accounts (useful for debugging or re-running).
+# Default: true
+drain_on_exit = true
+
+# --- Simple L2 transactions ---
+[simulation.simple_tx]
+# Transaction rate in tx/s. This is the primary traffic driver.
+#
+# Supports several forms:
+#
+#   Constant:
+#     rate = 10.0
+#
+#   Piecewise-linear curve (interpolated over simulation length):
+#     rate = [1.0, 10.0, 50.0, 100.0]
+#
+#   Linear ramp (two-element shorthand):
+#     rate = [1.0, 100.0]
+#
+#   Random — uniform random value each tick in [min, max]:
+#     rate = { random = true, min = 1.0, max = 100.0 }
+#
+#   Random with cap only (min defaults to 0):
+#     rate = { random = true, cap = 50.0 }
+#
+#   Random with default cap (0–100 tx/s):
+#     rate = { random = true }
+#
+#   Base curve + jitter — deterministic shape with additive noise ±jitter:
+#     rate = { base = [1.0, 50.0], jitter = 5.0 }
+#
+#   Adaptive max-pressure — automatically adjusts rate to keep blocks full
+#   without flooding the mempool. Uses an AIMD feedback loop that monitors
+#   txpool_pending and ramps up/down to stay near the target:
+#     rate = "max"                                           # shorthand with defaults
+#     rate = { adaptive = true }                             # equivalent to "max"
+#     rate = { adaptive = true, target_pending = 100 }       # custom pending target
+#     rate = { adaptive = true, target_pending = 200, max_rate = 3000 }
+#
+#   Adaptive mode parameters:
+#     target_pending — desired txpool_pending count (default: 100). Keep this
+#       small enough to avoid "txpool is full" errors but large enough that
+#       the next block(s) always have work queued.
+#     max_rate — safety cap in tx/s (default: 5000). Prevents runaway if
+#       metrics collection lags behind reality.
+#
+#   Disabled:
+#     rate = 0
+#
+#   Separate runs at different constant rates (not a within-run curve):
+#     rate = 0   # or omit
+#     rate_runs = [10.0, 50.0, 100.0]
+#     # → one experiment run per value, multiplied by the batcher sweep.
+#
+# Default: 0 (disabled)
+rate = 1.0
+
+# Optional: list of simple_tx rates (tx/s), one experiment run per entry.
+# Leave unset when using a normal rate curve. See above.
+# rate_runs = [10.0, 25.0, 50.0]
+
+# Value per transaction in RBTC.
+# 0 sends zero-value self-transfers (cheapest, 21000 gas).
+# Non-zero values transfer RBTC between accounts.
+#
+# Supports the same curve syntax as rate:
+#   value = 0                                     # constant zero (self-transfers)
+#   value = 0.001                                 # constant 0.001 RBTC per tx
+#   value = [0.001, 0.01]                         # ramp from 0.001 to 0.01 RBTC
+#   value = { random = true, min = 0, max = 0.01 }  # random value per tick
+#   value = { base = 0.005, jitter = 0.002 }      # 0.005 ± 0.002 RBTC
+#   value = "0.001"                               # string form also accepted
+#
+# Default: 0
+value = 0
+
+# Calldata size in bytes to attach to each simple transaction.
+# When 0 (default), transactions carry no calldata (plain value transfers,
+# 21000 gas). When > 0, each tx includes N bytes of random calldata and
+# the gas limit is computed per EVM rules (21000 + 16 per non-zero byte +
+# 4 per zero byte). Useful for measuring compression efficiency with
+# realistic data payloads.
+# Default: 0
+calldata_size = 0
+
+# --- L2 ERC20 transfer traffic ---
+# Calls `transfer(to, amount)` on an L2 ERC20 contract from the derived traffic
+# accounts, sending to random peers. Runs concurrently with [simulation.simple_tx];
+# set simple_tx.rate = 0 to make ERC20 transfers the sole L2 traffic.
+#
+# Token resolution (in order):
+#   1. `erc20_contract_l2` under [simulation.deposit_erc20] or
+#      [simulation.withdraw_erc20] (deposit takes precedence).
+#   2. USDRIFTokenL2 / ERC20TrafficToken from the underlying monitor config.
+#   3. **Auto-deploy fallback (default, hands-off):** if none of the above is
+#      configured, the runner deploys a self-contained fixed-supply ERC20
+#      (Token.sol) on L2 from the master key, minting 1e14 * 1e18 base units
+#      to the master. The simulator then funds each derived traffic account
+#      from the master via direct L2 transfers — no L1 bridge, no periodic
+#      deposits, no manual address to set. This is the simplest way to drive
+#      pure ERC20 traffic.
+[simulation.erc20_tx]
+# Transfers per second. Supports the same curve syntax as simple_tx.rate
+# (constant, array, random, jitter, adaptive). 0 disables.
+# Default: 0
+rate = 0
+
+# Amount per transfer in the token's smallest units (no decimals applied).
+# E.g. for an 18-decimal token, value = 100 sends 100 wei-of-token, not 100
+# whole tokens. Supports the same curve syntax as simple_tx.value.
+# Default: 0
+value = 100
+
+# --- RBTC deposits (L1 -> L2 via OptimismPortal) ---
+[simulation.deposit_rbtc]
+# Rate: deposits per second. Supports the same curve syntax as simple_tx rate.
+#
+#   Disabled:
+#     rate = 0
+#
+#   Constant (e.g. 1 deposit every 10 seconds):
+#     rate = 0.1
+#
+#   Piecewise-linear ramp:
+#     rate = [0.05, 0.5]
+#
+#   Random — uniform random deposits/s each tick:
+#     rate = { random = true, min = 0.01, max = 0.2 }
+#
+#   Base curve + jitter:
+#     rate = { base = 0.1, jitter = 0.05 }
+#
+# Default: 0 (disabled)
+rate = 0
+
+# Amount of RBTC per deposit. The master account on L1 must have sufficient
+# balance for all deposits across the simulation length.
+#
+# Supports the same curve syntax as rate:
+#   value = 0.001                                   # constant
+#   value = [0.001, 0.01, 0.05]                     # ramp up over time
+#   value = { random = true, min = 0.001, max = 0.1 } # random per deposit
+#   value = { base = 0.01, jitter = 0.005 }          # 0.01 ± 0.005
+#
+# Default: 0.001 RBTC
+value = 0.001
+
+# --- ERC20 deposits (L1 -> L2 via L1StandardBridge) ---
+[simulation.deposit_erc20]
+# Rate: deposits per second. Supports the same curve syntax as deposit_rbtc rate.
+# Default: 0 (disabled)
+rate = 0
+
+# Amount of ERC20 tokens per deposit (in token units, e.g. 0.001).
+# This is going to be USDRIF, so the value is in USDRIF units.
+# Supports the same curve syntax as other value fields.
+# Default: 0.001
+value = 0.001
+
+# L1 ERC20 contract address. Leave empty to use a mock ERC20 from OpenZeppelin.
+# erc20_contract_l1 = "0x..."
+
+# L2 ERC20 contract address. Leave empty to deploy a new OptimismMintableERC20
+# via L1StandardBridge on the first deposit.
+# erc20_contract_l2 = "0x..."
+
+# --- RBTC withdrawals (L2 -> L1 via L2ToL1MessagePasser + OptimismPortal) ---
+[simulation.withdraw_rbtc]
+# Rate: withdrawals per second. Supports the same curve syntax as deposit rate.
+#
+# Note: withdrawals are long-running operations (initiate on L2, then prove +
+# finalize on L1 after the dispute game resolves). The rate controls how often
+# new withdrawals are initiated; each runs to completion asynchronously.
+#
+#   Disabled:
+#     rate = 0
+#
+#   Constant (e.g. 1 withdrawal every 60 seconds):
+#     rate = 0.0167
+#
+#   Base curve + jitter:
+#     rate = { base = 0.02, jitter = 0.01 }
+#
+# Default: 0 (disabled)
+rate = 0
+
+# Amount of RBTC per withdrawal.
+# Supports the same curve syntax as other value fields.
+# Default: 0.001 RBTC
+value = 0.001
+
+# --- ERC20 withdrawals (L2 -> L1 via L2StandardBridge) ---
+[simulation.withdraw_erc20]
+# Rate: withdrawals per second. Supports the same curve syntax as withdraw_rbtc rate.
+# Default: 0 (disabled)
+rate = 0
+
+# Amount of ERC20 tokens per withdrawal (in token units).
+# Supports the same curve syntax as other value fields.
+# Default: 0.001
+value = 0.001
+
+# ERC20 contract addresses for withdrawals. If omitted, the addresses from
+# deposit_erc20 are used. Leave empty to use mock/auto-deployed contracts.
+# erc20_contract_l1 = "0x..."
+# erc20_contract_l2 = "0x..."
+
+# ==============================================================================
+# Chain: L2 chain-level parameters that can be swept.
+# These are separate from batcher knobs because they affect the chain itself
+# rather than batcher behaviour.
+# ==============================================================================
+[chain]
+# L2 gas limit, changed at runtime via SystemConfig.setGasLimit() on L1.
+# Requires target.workdir to be set (for the SystemConfigProxy address in
+# l1.json) and a funded owner key (master_private_key from the rollup-node
+# config, or target.private_key as fallback).
+#
+# Single value (set once at start):
+#   gas_limit = 30000000
+#
+# Array (sweep — one run per value, combined with batcher knobs):
+#   gas_limit = [15000000, 30000000, 60000000]
+#
+# Default: 0 (leave the current on-chain gas limit unchanged)
+gas_limit = 0
+
+# L2 block time in seconds. Changing this requires editing rollup.json and
+# restarting the rollup-node, which the experiment tool handles automatically
+# when --rollup-node-config is provided.
+#
+# Single value:
+#   block_time = 2
+#
+# Array (sweep):
+#   block_time = [1, 2, 4]
+#
+# Default: 0 (keep the current block time)
+block_time = 0
+
+# ==============================================================================
+# Run Start Conditions: thresholds that must be met before starting each run.
+# This ensures consistent initial state across runs by waiting for the batcher
+# to drain its queue before beginning a new run.
+#
+# Between runs, the sequencer is paused and the batcher is drained:
+#
+# If sequencer pause succeeds (no new blocks), full drain checks:
+#   - pending_blocks_count = 0 (no blocks waiting to be added to channel)
+#   - pending_blocks_bytes_current = 0 (no bytes in pending stage)
+#   - blocks_added_count = 0 (no blocks in current channel being built)
+#
+# If sequencer pause fails (blocks still arriving), partial drain checks:
+#   - blocks_added_count = 0 (current channel has been posted)
+#
+# This prevents data from previous runs from being posted during a new run,
+# ensuring consistent and comparable metrics across experiment runs.
+#
+# Each CSV row includes:
+#   clean_start (true/false) — run started with a fully drained batcher.
+#     Runs with clean_start=false may have early samples contaminated by pre-run data.
+#   start_unsafe_blocks — L2 unsafe head block number at run start.
+#     Useful for post-processing to attribute data to blocks produced in this run.
+
+# ==============================================================================
+# Run ID Strategy
+# ==============================================================================
+# How to assign run IDs when adding new experiment runs to an existing directory.
+#
+#   "max" (default): Continue past the highest existing run ID.
+#                    If runs 1,2,3,7,8 exist, next run is 9.
+#
+#   "min": Fill gaps by using the smallest unused positive integer.
+#          If runs 1,2,3,7,8 exist, next run is 4.
+#
+# This is useful after using `remove-runs` to delete specific runs and wanting
+# to fill the gaps rather than continue numbering.
+next_run_strategy = "max"
+
+# ==============================================================================
+[run_start_conditions]
+# Maximum pending blocks in the batcher queue before starting a run.
+# Set to a number to wait until pending_blocks_count <= this value.
+# Set to "any" to disable this condition.
+# Default: 500
+pending_blocks = 500
+
+# Maximum safe head lag (unsafe L2 head - safe L2 head) before starting a run.
+# Set to a number to wait until safe_lag <= this value.
+# Set to "any" to disable this condition.
+# Default: "any"
+safe_lag = "any"
+
+# Timeout for waiting for conditions to be met.
+# If conditions are not met within this duration, the run starts anyway with a warning.
+# Default: "5m"
+timeout = "5m"
+
+# Whether to check conditions before the first run.
+# Set to true if you want to ensure the batcher is in a good state before starting.
+# Default: false (only check between runs, not before the first one)
+on_first_run = false
+
+# Pause the sequencer while waiting for conditions to be met.
+# This stops L2 block production, allowing the batcher to catch up without
+# new blocks being added to its queue. The sequencer is automatically
+# restarted when conditions are met or on timeout.
+# Default: false
+pause_sequencer = false
+
+# Periodically call admin_flushBatcher while waiting for conditions.
+# This forces the batcher to post pending data immediately rather than
+# waiting for channels to fill. Flushes every 30 seconds during the wait.
+# Default: false
+flush_batcher = false
+
+# ==============================================================================
+# Batcher: knobs that are FIXED per experiment run.
+# Array values trigger a parameter sweep — one run per combination.
+#
+# Example: if max_l1_tx_size = [60000, 120000] and max_pending_tx = [1, 3],
+# the tool will run 4 experiments (cartesian product):
+#   Run 1: max_l1_tx_size=60000,  max_pending_tx=1
+#   Run 2: max_l1_tx_size=60000,  max_pending_tx=3
+#   Run 3: max_l1_tx_size=120000, max_pending_tx=1
+#   Run 4: max_l1_tx_size=120000, max_pending_tx=3
+#
+# NOTE: Some parameters require specific OP Stack hardfork upgrades.
+# Before running, the tool validates each configuration against the
+# rollup.json fork schedule and automatically skips unsupported runs.
+# ==============================================================================
+[batcher]
+# Maximum size of a batch tx submitted to L1 in bytes (frame size + 1).
+# This is the main driver for L1 posting cost vs latency tradeoff.
+# Larger values pack more L2 data per L1 tx but cost more gas per post.
+# Default: 120000 (120 KB). Array = sweep across values.
+max_l1_tx_size = 120000
+
+# Maximum L1 blocks to keep a channel open before it is sealed and posted.
+# 0 = unlimited (channel stays open until full). Setting this lower forces
+# more frequent L1 posts but reduces L2-to-L1 data latency.
+# Default: 0
+max_channel_duration = 0
+
+# Maximum number of L2 blocks that can be packed into a single span batch.
+# 0 = unlimited. Relevant only when batch_type = 1 (SpanBatch).
+# Has no effect when batch_type = 0 (SingularBatch).
+# Default: 0
+max_blocks_per_span_batch = 0
+
+# Maximum number of L1 transactions that can be in-flight simultaneously.
+# Higher values allow parallel L1 posting but risk nonce conflicts.
+# Default: 1
+max_pending_tx = 1
+
+# Batch type: 0 = SingularBatch, 1 = SpanBatch.
+# SpanBatch packs multiple L2 blocks more efficiently but requires
+# the Delta upgrade to be active (fork order: Regolith > Canyon > Delta).
+# Runs with unsupported batch_type are automatically skipped based on
+# the rollup.json fork schedule.
+# Default: 0 (SingularBatch)
+batch_type = 1
+
+# Compression algorithm for channel data.
+# Options: "zlib", "brotli", "brotli-9", "brotli-10", "brotli-11"
+# Higher brotli levels give better compression but use more CPU.
+# Brotli variants require the Fjord upgrade to be active
+# (fork order: Regolith > Canyon > Delta > Ecotone > Fjord).
+# Runs with unsupported compression_algo are automatically skipped based on
+# the rollup.json fork schedule.
+# Default: "zlib"
+compression_algo = "brotli-10"
+
+# Safety margin in L1 blocks subtracted from the channel timeout.
+# Ensures the channel is sealed early enough to be included on L1
+# before the timeout expires.
+# Default: 10
+sub_safety_margin = 10
+
+# ==============================================================================
+# Measurements: which metrics to collect
+#
+# For each enabled measurement, the tool extracts curves on a multidimensional
+# plane consisting of the knob parameters and time.
+# ==============================================================================
+[measurements]
+# Enable all measurements (overrides individual flags below).
+# Default: false (individual measurements must be enabled)
+enable_all = true
+
+# Or selectively enable specific measurements:
+
+# TPS — Number of L2 user transactions per second, sampled per L2 block.
+# tps = true
+
+# L1 tx cost — Amortized cost of L1 posting per L2 transaction.
+# Computed as: rolling sum(batcher_post_cost) / sum(l2_tx_count).
+# Note: exact per-tx attribution is not possible due to channel compression
+# and fragmentation, but the amortized metric is the standard rollup benchmark.
+# l1_tx_cost = true
+
+# L2 tx cost — Cost of executing the transaction on L2 (gas_price * gas_used + l1_fee).
+# l2_tx_cost = true
+
+# Total tx cost — L1 amortized cost + L2 execution cost.
+# total_tx_cost = true
+
+# Deposit cost — Gas cost of L1->L2 bridge operations (per type: RBTC, ERC20).
+# deposit_cost = true
+
+# Withdrawal cost — Gas cost of L2->L1 exit (prove + finalize steps on L1).
+# withdrawal_cost = true
+
+# Data compression ratio — Ratio of compressed output to raw input bytes
+# in the batcher channel. Scraped from batcher Prometheus metrics
+# (op_batcher_channel_compr_ratio). Requires batcher metrics to be enabled,
+# which this tool does automatically when managing the batcher process.
+# compression_ratio = true
+
+# Data per transaction — Amortized L1 data per L2 transaction in KB.
+# Two derived columns are added to the CSV:
+#   compressed_data_per_tx_kb — compressed L1 calldata per L2 tx (actual on-chain footprint)
+#   raw_data_per_tx_kb        — raw (pre-compression) data per L2 tx
+# Computed as: cumulative batcher_data_size / cumulative l2_tx_count / 1024.
+# Raw = compressed / compression_ratio. Useful for measuring compression
+# efficiency at different data volumes (tx rates).
+# data_per_tx = true
+
+# ==============================================================================
+# Live: configuration for the real-time analysis TUI (--live mode)
+#
+# Controls which chart panels and overlays are displayed, log buffer sizing,
+# and the default chart time window.
+# ==============================================================================
+[live]
+# Which chart panels to display, in order. Comment out or remove entries to
+# hide panels you don't need. Available panels:
+#
+#   "tps"                   — Transactions per second
+#   "l2_tx_cost"            — L2 transaction cost in RBTC
+#   "l2_tx_speed"           — L2 transaction confirmation speed in seconds
+#   "txs_per_block"         — Number of transactions per L2 block
+#   "batcher_post_cost"     — Cost of batcher L1 posts in RBTC
+#   "compression_ratio"     — Batcher channel compression ratio
+#   "batcher_data_size"     — Raw calldata size per batcher L1 post (bytes)
+#   "batcher_pipeline"      — Batcher pending blocks and bytes (multi-series)
+#   "l1_fee_pressure"       — L1 base fee (gwei) and gas bumps (multi-series)
+#   "deposits_withdrawals"  — Deposit and withdrawal counts (full-width)
+#
+# Default: all available panels
+# panels = ["tps", "l2_tx_cost", "l2_tx_speed", "txs_per_block", "batcher_post_cost", "compression_ratio", "deposits_withdrawals"]
+
+# Show the action log panel below the charts.
+# The action log displays experiment progress, warnings, and errors.
+# Default: true
+show_log = true
+
+# Number of visible log lines in the compact action log panel.
+# The full log is always accessible via the 'l' key overlay.
+# Default: 3
+log_lines = 3
+
+# Maximum number of log entries kept in the ring buffer.
+# Older entries are discarded when the buffer is full.
+# Default: 200
+log_buffer_size = 200
+
+# Default time window for chart X-axis (Go duration syntax).
+# Charts auto-fit to data on first load, but this sets the initial window
+# and the baseline for zoom reset (0 key).
+# Default: "5m"
+time_window = "5m"
+
+# Automatically exit the process when all experiment runs complete.
+# When false (default), the live TUI stays open after runs finish so you
+# can inspect charts interactively; press q to exit.
+# When true, the process exits immediately after generating the report,
+# which is useful for unattended or scripted runs.
+# Default: false
+auto_quit = false
